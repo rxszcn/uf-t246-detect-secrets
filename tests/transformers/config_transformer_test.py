@@ -6,6 +6,7 @@ import pytest
 from detect_secrets.transformers.config import ConfigFileTransformer
 from detect_secrets.transformers.config import EagerConfigFileTransformer
 from detect_secrets.transformers.config import IniFileParser
+from detect_secrets.util.filetype import FileType
 from testing.mocks import mock_file_object
 
 
@@ -263,3 +264,36 @@ class TestMultipleValues:
             ('key', 'value1', 5),
             ('key', 'value2', 8),
         ]
+
+
+def test_eager_transformer_only_applies_to_other_file_types():
+    # The non-eager transformer unconditionally claims config-looking files; the eager
+    # variant is restricted to `FileType.OTHER` (e.g. `.env`). This split is what makes the
+    # scanner's two-pass contract work: unquoted values only get their artificial quotes on
+    # the eager fallback pass, so relaxing this restriction would change which pass finds
+    # what and re-introduce the file-level short-circuit.
+    assert ConfigFileTransformer().is_eager is False
+    assert EagerConfigFileTransformer().is_eager is True
+
+    eager_transformer = EagerConfigFileTransformer()
+
+    assert FileType.OTHER.value != FileType.INI.value
+    assert eager_transformer.should_parse_file('config.env') is True
+    assert eager_transformer.should_parse_file('config.ini') is False
+
+
+def test_eager_transformer_adds_quotes_to_unquoted_env_values():
+    # `.env` files have no section header, so the eager transformer prepends one and
+    # normalizes every value into an artificially-quoted assignment. The high-entropy plugin
+    # only matches quoted strings, which is why unquoted secrets depend on this pass.
+    file = mock_file_object(
+        textwrap.dedent("""
+            quoted="gX69YO4CvBsVjzAwYxdGyDd30t5+9ez31gKATtj4"
+            unquoted=hA70ZP5DwCtWk0BxYxHzEe41u6+0fa42hLBUuk5
+        """)[1:-1],
+    )
+
+    assert EagerConfigFileTransformer().parse_file(file) == [
+        'quoted = "gX69YO4CvBsVjzAwYxdGyDd30t5+9ez31gKATtj4"',
+        'unquoted = "hA70ZP5DwCtWk0BxYxHzEe41u6+0fa42hLBUuk5"',
+    ]

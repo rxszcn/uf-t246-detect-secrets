@@ -150,17 +150,30 @@ def scan_file(filename: str) -> Generator[PotentialSecret, None, None]:
         return
 
     try:
-        has_secret = False
+        # `_get_lines_from_file` yields up to two passes: the lazy (non-eager) transformer
+        # output first, and the eager transformer output as a fallback. Eager transformers
+        # (e.g. `EagerConfigFileTransformer`) can surface secrets that the lazy pass has no
+        # way of finding -- notably, unquoted values in `.env`-style files, which the
+        # high-entropy plugin's quote-dependent regex would otherwise miss.
+        #
+        # Therefore, we cannot short-circuit the eager pass merely because the lazy pass
+        # found something: doing so silently drops every secret that only the eager pass can
+        # detect whenever the two coexist in the same file. We run both passes to completion
+        # and merge their output, deduplicating by the secret's identity (filename, hash and
+        # type -- line numbers are intentionally excluded, see `PotentialSecret`). On a
+        # collision the lazy-pass copy wins, since it is yielded first and preserves the
+        # line number attributed by the default transformation.
+        seen_secrets: Set[PotentialSecret] = set()
         for lines in _get_lines_from_file(filename):
             for secret in _process_line_based_plugins(
                 lines=list(enumerate(lines, start=1)),
                 filename=filename,
             ):
-                has_secret = True
-                yield secret
+                if secret in seen_secrets:
+                    continue
 
-            if has_secret:
-                break
+                seen_secrets.add(secret)
+                yield secret
     except IOError:
         log.warning(f'Unable to open file: {filename}')
         return

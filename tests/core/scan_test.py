@@ -73,6 +73,11 @@ class TestGetFilesToScan:
 
 
 class TestScanFile:
+    # High-entropy values that exceed the Base64HighEntropyString default limit (4.5),
+    # so they are detected regardless of whether they are quoted.
+    QUOTED_SECRET = 'gX69YO4CvBsVjzAwYxdGyDd30t5+9ez31gKATtj4'
+    UNQUOTED_SECRET = 'hA70ZP5DwCtWk0BxYxHzEe41u6+0fa42hLBUuk5'
+
     @staticmethod
     def test_handles_broken_yaml_gracefully():
         with mock_named_temporary_file(suffix='.yaml') as f:
@@ -95,6 +100,77 @@ class TestScanFile:
             f.seek(0)
 
             assert not list(scan.scan_file(f.name))
+
+    @staticmethod
+    @pytest.mark.parametrize(
+        'content, expected_secrets, expected_line_numbers',
+        (
+            # Quoted and unquoted secrets coexisting: both must survive, even though the lazy
+            # pass matches the quoted one first (which used to short-circuit the eager pass).
+            (
+                'quoted="{quoted}"\nunquoted={unquoted}\n',
+                {'{quoted}', '{unquoted}'},
+                {1, 2},
+            ),
+
+            # Reversing the order must not change the result set: the old failure was a
+            # file-level short-circuit, not an ordering effect.
+            (
+                'unquoted={unquoted}\nquoted="{quoted}"\n',
+                {'{quoted}', '{unquoted}'},
+                {1, 2},
+            ),
+
+            # Pure quoted file: the lazy pass alone is sufficient.
+            (
+                'quoted="{quoted}"\n',
+                {'{quoted}'},
+                {1},
+            ),
+
+            # Pure unquoted file: only the eager pass can add the quotes the plugin requires.
+            (
+                'unquoted={unquoted}\n',
+                {'{unquoted}'},
+                {1},
+            ),
+        ),
+    )
+    def test_quoted_and_unquoted_secrets_in_env_file(
+        content,
+        expected_secrets,
+        expected_line_numbers,
+    ):
+        content = content.format(
+            quoted=TestScanFile.QUOTED_SECRET,
+            unquoted=TestScanFile.UNQUOTED_SECRET,
+        )
+        expected_secrets = {
+            value.format(
+                quoted=TestScanFile.QUOTED_SECRET,
+                unquoted=TestScanFile.UNQUOTED_SECRET,
+            )
+            for value in expected_secrets
+        }
+
+        with transient_settings({
+            'plugins_used': [
+                {
+                    'name': 'Base64HighEntropyString',
+                },
+            ],
+        }):
+            with mock_named_temporary_file(suffix='.env') as f:
+                f.write(content.encode())
+                f.seek(0)
+
+                secrets = list(scan.scan_file(f.name))
+
+        assert {secret.secret_value for secret in secrets} == expected_secrets
+        assert {secret.line_number for secret in secrets} == expected_line_numbers
+        # Identity-based deduplication (filename, hash, type) must keep the two-pass output
+        # free of duplicates.
+        assert len(secrets) == len(expected_secrets)
 
 
 @pytest.fixture(autouse=True)
